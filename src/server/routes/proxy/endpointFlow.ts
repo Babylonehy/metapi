@@ -26,6 +26,7 @@ export type EndpointAttemptContext = {
   targetUrl: string;
   response: Awaited<ReturnType<typeof fetch>>;
   rawErrText: string;
+  recoverApplied?: boolean;
 };
 
 export type EndpointAttemptSuccessContext = {
@@ -34,6 +35,7 @@ export type EndpointAttemptSuccessContext = {
   request: BuiltEndpointRequest;
   targetUrl: string;
   response: Awaited<ReturnType<typeof fetch>>;
+  recoverApplied?: boolean;
 };
 
 export type EndpointRecoverResult = {
@@ -63,6 +65,7 @@ export function withUpstreamPath(path: string, message: string): string {
 type ExecuteEndpointFlowInput = {
   siteUrl: string;
   proxyUrl?: string | null;
+  disableCrossProtocolFallback?: boolean;
   endpointCandidates: UpstreamEndpoint[];
   buildRequest: (endpoint: UpstreamEndpoint, endpointIndex: number) => BuiltEndpointRequest;
   dispatchRequest?: (
@@ -125,6 +128,7 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
         request,
         targetUrl,
         response,
+        recoverApplied: false,
       }, 'onAttemptSuccess');
       return {
         ok: true,
@@ -141,10 +145,15 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
       targetUrl,
       response,
       rawErrText,
+      recoverApplied: false,
     };
 
     if (input.tryRecover) {
       const recovered = await input.tryRecover(baseContext);
+      baseContext.recoverApplied = recovered !== null
+        || baseContext.request !== request
+        || baseContext.response !== response
+        || baseContext.rawErrText !== rawErrText;
       if (recovered?.upstream?.ok) {
         const recoveredRequest = recovered.request ?? baseContext.request;
         const recoveredTargetUrl = recovered.targetUrl ?? (
@@ -158,6 +167,7 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
           request: recoveredRequest,
           targetUrl: recoveredTargetUrl,
           response: recovered.upstream,
+          recoverApplied: true,
         }, 'onAttemptSuccess');
         return {
           ok: true,
@@ -180,6 +190,12 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
     }, 'onAttemptFailure');
 
     const isLastEndpoint = endpointIndex >= endpointCount - 1;
+    if (input.disableCrossProtocolFallback && !isLastEndpoint) {
+      finalStatus = response.status;
+      finalErrText = errText;
+      finalRawErrText = rawErrText;
+      break;
+    }
     const shouldDowngrade = !isLastEndpoint && !!input.shouldDowngrade?.(baseContext);
     if (shouldDowngrade) {
       await runEndpointFlowHook(input.onDowngrade, {

@@ -20,6 +20,7 @@ import { monitorRoutes } from './routes/api/monitor.js';
 import { downstreamApiKeysRoutes } from './routes/api/downstreamApiKeys.js';
 import { oauthRoutes } from './routes/api/oauth.js';
 import { siteAnnouncementsRoutes } from './routes/api/siteAnnouncements.js';
+import { updateCenterRoutes } from './routes/api/updateCenter.js';
 import { proxyRoutes } from './routes/proxy/router.js';
 import { startScheduler } from './services/checkinScheduler.js';
 import * as routeRefreshWorkflow from './services/routeRefreshWorkflow.js';
@@ -30,8 +31,10 @@ import { repairStoredCreatedAtValues } from './services/storedTimestampRepairSer
 import { migrateSiteApiKeysToAccounts } from './services/siteApiKeyMigrationService.js';
 import { ensureDefaultSitesSeeded } from './services/defaultSiteSeedService.js';
 import { ensureOauthIdentityBackfill } from './services/oauth/oauthIdentityBackfill.js';
+import { ensureOauthProviderSitesExist } from './services/oauth/oauthSiteRegistry.js';
 import { startOAuthLoopbackCallbackServers, stopOAuthLoopbackCallbackServers } from './services/oauth/localCallbackServer.js';
-import { startSiteAnnouncementPolling } from './services/siteAnnouncementPollingService.js';
+import { startSiteAnnouncementPolling, stopSiteAnnouncementPolling } from './services/siteAnnouncementPollingService.js';
+import { startUpdateCenterPolling, stopUpdateCenterPolling } from './services/updateCenterPollingService.js';
 import { reloadBackupWebdavScheduler } from './services/backupService.js';
 import { ensureRuntimeDatabaseReady } from './runtimeDatabaseBootstrap.js';
 import { isPublicApiRoute, registerDesktopRoutes } from './desktop.js';
@@ -226,6 +229,51 @@ function applyRuntimeSettings(settingsMap: Map<string, string>) {
     config.proxySessionChannelQueueWaitMs = Math.trunc(proxySessionChannelQueueWaitMs);
   }
 
+  const proxyDebugTraceEnabled = parseSettingFromMap<boolean>(settingsMap, 'proxy_debug_trace_enabled');
+  if (typeof proxyDebugTraceEnabled === 'boolean') {
+    config.proxyDebugTraceEnabled = proxyDebugTraceEnabled;
+  }
+
+  const proxyDebugCaptureHeaders = parseSettingFromMap<boolean>(settingsMap, 'proxy_debug_capture_headers');
+  if (typeof proxyDebugCaptureHeaders === 'boolean') {
+    config.proxyDebugCaptureHeaders = proxyDebugCaptureHeaders;
+  }
+
+  const proxyDebugCaptureBodies = parseSettingFromMap<boolean>(settingsMap, 'proxy_debug_capture_bodies');
+  if (typeof proxyDebugCaptureBodies === 'boolean') {
+    config.proxyDebugCaptureBodies = proxyDebugCaptureBodies;
+  }
+
+  const proxyDebugCaptureStreamChunks = parseSettingFromMap<boolean>(settingsMap, 'proxy_debug_capture_stream_chunks');
+  if (typeof proxyDebugCaptureStreamChunks === 'boolean') {
+    config.proxyDebugCaptureStreamChunks = proxyDebugCaptureStreamChunks;
+  }
+
+  const proxyDebugTargetSessionId = parseSettingFromMap<string>(settingsMap, 'proxy_debug_target_session_id');
+  if (typeof proxyDebugTargetSessionId === 'string') {
+    config.proxyDebugTargetSessionId = proxyDebugTargetSessionId.trim();
+  }
+
+  const proxyDebugTargetClientKind = parseSettingFromMap<string>(settingsMap, 'proxy_debug_target_client_kind');
+  if (typeof proxyDebugTargetClientKind === 'string') {
+    config.proxyDebugTargetClientKind = proxyDebugTargetClientKind.trim();
+  }
+
+  const proxyDebugTargetModel = parseSettingFromMap<string>(settingsMap, 'proxy_debug_target_model');
+  if (typeof proxyDebugTargetModel === 'string') {
+    config.proxyDebugTargetModel = proxyDebugTargetModel.trim();
+  }
+
+  const proxyDebugRetentionHours = parseSettingFromMap<number>(settingsMap, 'proxy_debug_retention_hours');
+  if (typeof proxyDebugRetentionHours === 'number' && Number.isFinite(proxyDebugRetentionHours) && proxyDebugRetentionHours >= 1) {
+    config.proxyDebugRetentionHours = Math.trunc(proxyDebugRetentionHours);
+  }
+
+  const proxyDebugMaxBodyBytes = parseSettingFromMap<number>(settingsMap, 'proxy_debug_max_body_bytes');
+  if (typeof proxyDebugMaxBodyBytes === 'number' && Number.isFinite(proxyDebugMaxBodyBytes) && proxyDebugMaxBodyBytes >= 1024) {
+    config.proxyDebugMaxBodyBytes = Math.trunc(proxyDebugMaxBodyBytes);
+  }
+
   const routingWeights = parseSettingFromMap<Partial<typeof config.routingWeights>>(settingsMap, 'routing_weights');
   if (routingWeights && typeof routingWeights === 'object') {
     config.routingWeights = {
@@ -369,6 +417,8 @@ try {
   console.warn(`Failed to load runtime settings overrides: ${(error as Error)?.message || 'unknown error'}`);
 }
 
+await ensureOauthProviderSitesExist();
+
 const app = Fastify(buildFastifyOptions(config));
 
 await app.register(cors);
@@ -391,9 +441,10 @@ await app.register(authRoutes);
 await app.register(settingsRoutes);
 await app.register(accountTokensRoutes);
 await app.register(searchRoutes);
-  await app.register(eventsRoutes);
-  await app.register(siteAnnouncementsRoutes);
-  await app.register(taskRoutes);
+await app.register(eventsRoutes);
+await app.register(siteAnnouncementsRoutes);
+await app.register(updateCenterRoutes);
+await app.register(taskRoutes);
 await app.register(testRoutes);
 await app.register(monitorRoutes);
 await app.register(downstreamApiKeysRoutes);
@@ -433,6 +484,7 @@ if (existsSync(webDir)) {
 await startScheduler();
 await reloadBackupWebdavScheduler();
 startSiteAnnouncementPolling();
+startUpdateCenterPolling();
 try {
   await startOAuthLoopbackCallbackServers();
 } catch (error) {
@@ -441,6 +493,8 @@ try {
 setLegacyProxyLogRetentionFallbackEnabled(!config.logCleanupConfigured);
 startProxyFileRetentionService();
 app.addHook('onClose', async () => {
+  stopSiteAnnouncementPolling();
+  stopUpdateCenterPolling();
   stopProxyFileRetentionService();
   stopProxyLogRetentionService();
   await stopOAuthLoopbackCallbackServers();

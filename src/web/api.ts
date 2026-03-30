@@ -1,5 +1,11 @@
 import { clearAuthSession, getAuthToken } from './authSession.js';
 
+type BufferLike = {
+  from(data: ArrayBuffer): { toString(encoding: 'base64'): string };
+};
+
+const nodeBuffer = (globalThis as typeof globalThis & { Buffer?: BufferLike }).Buffer;
+
 type RequestOptions = RequestInit & {
   timeoutMs?: number;
 };
@@ -58,8 +64,8 @@ function parseContentDispositionFilename(headerValue: string | null): string | n
 }
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  if (typeof Buffer !== 'undefined') {
-    return Buffer.from(buffer).toString('base64');
+  if (nodeBuffer) {
+    return nodeBuffer.from(buffer).toString('base64');
   }
 
   let binary = '';
@@ -134,6 +140,80 @@ async function request(url: string, options: RequestOptions = {}) {
     throw new Error(await extractResponseErrorMessage(res));
   }
   return res.json();
+}
+
+async function streamSse(
+  url: string,
+  handlers: {
+    onLog?: (entry: any) => void;
+    onDone?: (payload: any) => void;
+    signal?: AbortSignal;
+  },
+) {
+  const response = await fetchAuthenticatedResponse(url, {
+    method: 'GET',
+    signal: handlers.signal,
+    headers: {
+      Accept: 'text/event-stream',
+    },
+    timeoutMs: 120_000,
+  });
+
+  if (!response.ok) {
+    throw new Error(await extractResponseErrorMessage(response));
+  }
+  if (!response.body) {
+    throw new Error('响应未返回流式内容');
+  }
+
+  const decoder = new TextDecoder();
+  const reader = response.body.getReader();
+  let buffer = '';
+
+  const flushBuffer = (final = false) => {
+    const chunks = final ? [...buffer.split('\n\n'), ''] : buffer.split('\n\n');
+    if (!final) buffer = chunks.pop() || '';
+    else buffer = '';
+
+    for (const chunk of chunks) {
+      const lines = chunk.split('\n');
+      let eventName = 'message';
+      const dataLines: string[] = [];
+
+      for (const line of lines) {
+        if (line.startsWith('event:')) {
+          eventName = line.slice('event:'.length).trim() || 'message';
+        } else if (line.startsWith('data:')) {
+          dataLines.push(line.slice('data:'.length).trim());
+        }
+      }
+
+      if (dataLines.length <= 0) continue;
+      let payload: any = dataLines.join('\n');
+      try {
+        payload = JSON.parse(payload);
+      } catch {
+        // keep string payload
+      }
+
+      if (eventName === 'log') {
+        handlers.onLog?.(payload);
+      } else if (eventName === 'done') {
+        handlers.onDone?.(payload);
+      }
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    flushBuffer(false);
+  }
+
+  if (buffer.trim()) {
+    flushBuffer(true);
+  }
 }
 
 function buildQueryString(params?: Record<string, string | number | boolean | null | undefined>) {
@@ -249,6 +329,68 @@ export type SystemProxyTestResponse = {
   latencyMs: number;
 };
 
+export type RuntimeRoutingWeightsPayload = {
+  baseWeightFactor?: number;
+  valueScoreFactor?: number;
+  costWeight?: number;
+  balanceWeight?: number;
+  usageWeight?: number;
+};
+
+export type RuntimeSettingsPayload = {
+  proxyToken?: string;
+  systemProxyUrl?: string;
+  codexUpstreamWebsocketEnabled?: boolean;
+  disableCrossProtocolFallback?: boolean;
+  proxySessionChannelConcurrencyLimit?: number;
+  proxySessionChannelQueueWaitMs?: number;
+  proxyDebugTraceEnabled?: boolean;
+  proxyDebugCaptureHeaders?: boolean;
+  proxyDebugCaptureBodies?: boolean;
+  proxyDebugCaptureStreamChunks?: boolean;
+  proxyDebugTargetSessionId?: string;
+  proxyDebugTargetClientKind?: string;
+  proxyDebugTargetModel?: string;
+  proxyDebugRetentionHours?: number;
+  proxyDebugMaxBodyBytes?: number;
+  checkinCron?: string;
+  checkinScheduleMode?: 'cron' | 'interval';
+  checkinIntervalHours?: number;
+  balanceRefreshCron?: string;
+  logCleanupCron?: string;
+  logCleanupUsageLogsEnabled?: boolean;
+  logCleanupProgramLogsEnabled?: boolean;
+  logCleanupRetentionDays?: number;
+  webhookUrl?: string;
+  barkUrl?: string;
+  webhookEnabled?: boolean;
+  barkEnabled?: boolean;
+  serverChanEnabled?: boolean;
+  serverChanKey?: string;
+  telegramEnabled?: boolean;
+  telegramApiBaseUrl?: string;
+  telegramBotToken?: string;
+  telegramChatId?: string;
+  telegramUseSystemProxy?: boolean;
+  telegramMessageThreadId?: string;
+  smtpEnabled?: boolean;
+  smtpHost?: string;
+  smtpPort?: number;
+  smtpSecure?: boolean;
+  smtpUser?: string;
+  smtpPass?: string;
+  smtpFrom?: string;
+  smtpTo?: string;
+  notifyCooldownSec?: number;
+  adminIpAllowlist?: string[] | string;
+  routingFallbackUnitCost?: number;
+  routingWeights?: RuntimeRoutingWeightsPayload;
+  proxyErrorKeywords?: string[] | string;
+  proxyEmptyContentFailEnabled?: boolean;
+  globalBlockedBrands?: string[];
+  globalAllowedModels?: string[];
+};
+
 export type ProxyLogStatusFilter = 'all' | 'success' | 'failed';
 export type ProxyLogClientConfidence = 'exact' | 'heuristic' | 'unknown' | null;
 
@@ -351,6 +493,72 @@ export type ProxyLogsResponse = {
   summary: ProxyLogsSummary;
 };
 
+export type ProxyDebugTraceListItem = {
+  id: number;
+  createdAt: string;
+  downstreamPath: string;
+  clientKind?: string | null;
+  sessionId?: string | null;
+  requestedModel?: string | null;
+  selectedChannelId?: number | null;
+  finalStatus?: string | null;
+  finalHttpStatus?: number | null;
+  finalUpstreamPath?: string | null;
+};
+
+export type ProxyDebugTraceDetail = {
+  trace: {
+    id: number;
+    createdAt?: string | null;
+    updatedAt?: string | null;
+    downstreamPath?: string | null;
+    clientKind?: string | null;
+    sessionId?: string | null;
+    traceHint?: string | null;
+    requestedModel?: string | null;
+    stickySessionKey?: string | null;
+    stickyHitChannelId?: number | null;
+    selectedChannelId?: number | null;
+    selectedRouteId?: number | null;
+    selectedAccountId?: number | null;
+    selectedSiteId?: number | null;
+    selectedSitePlatform?: string | null;
+    endpointCandidatesJson?: string | null;
+    endpointRuntimeStateJson?: string | null;
+    decisionSummaryJson?: string | null;
+    requestHeadersJson?: string | null;
+    requestBodyJson?: string | null;
+    finalStatus?: string | null;
+    finalHttpStatus?: number | null;
+    finalUpstreamPath?: string | null;
+    finalResponseHeadersJson?: string | null;
+    finalResponseBodyJson?: string | null;
+  };
+  attempts: Array<{
+    id: number;
+    attemptIndex: number;
+    endpoint: string;
+    requestPath: string;
+    targetUrl: string;
+    runtimeExecutor?: string | null;
+    requestHeadersJson?: string | null;
+    requestBodyJson?: string | null;
+    responseStatus?: number | null;
+    responseHeadersJson?: string | null;
+    responseBodyJson?: string | null;
+    rawErrorText?: string | null;
+    recoverApplied?: boolean | null;
+    downgradeDecision?: boolean | null;
+    downgradeReason?: string | null;
+    memoryWriteJson?: string | null;
+    createdAt?: string | null;
+  }>;
+};
+
+export type ProxyDebugTracesResponse = {
+  items: ProxyDebugTraceListItem[];
+};
+
 export type OAuthProviderInfo = {
   provider: string;
   label: string;
@@ -431,6 +639,7 @@ export type OAuthConnectionInfo = {
   routeChannelCount?: number;
   lastModelSyncAt?: string | null;
   lastModelSyncError?: string | null;
+  proxyUrl?: string | null;
   site?: { id: number; name: string; url: string; platform: string } | null;
 };
 
@@ -546,6 +755,8 @@ export const api = {
   getDashboard: () => request('/api/stats/dashboard'),
   getProxyLogs: (params?: ProxyLogsQuery) => request(`/api/stats/proxy-logs${buildQueryString(params)}`) as Promise<ProxyLogsResponse>,
   getProxyLogDetail: (id: number) => request(`/api/stats/proxy-logs/${id}`) as Promise<ProxyLogDetail>,
+  getProxyDebugTraces: (params?: { limit?: number }) => request(`/api/stats/proxy-debug/traces${buildQueryString(params)}`) as Promise<ProxyDebugTracesResponse>,
+  getProxyDebugTraceDetail: (id: number) => request(`/api/stats/proxy-debug/traces/${id}`) as Promise<ProxyDebugTraceDetail>,
   checkModels: (accountId: number) => request(`/api/models/check/${accountId}`, { method: 'POST' }),
   getSiteDistribution: () => request('/api/stats/site-distribution'),
   getSiteTrend: (days = 7) => request(`/api/stats/site-trend?days=${days}`),
@@ -557,7 +768,7 @@ export const api = {
 
   // OAuth
   getOAuthProviders: () => request('/api/oauth/providers') as Promise<{ providers: OAuthProviderInfo[] }>,
-  startOAuthProvider: (provider: string, data?: { accountId?: number; projectId?: string }) => request(`/api/oauth/providers/${encodeURIComponent(provider)}/start`, {
+  startOAuthProvider: (provider: string, data?: { accountId?: number; projectId?: string; proxyUrl?: string | null }) => request(`/api/oauth/providers/${encodeURIComponent(provider)}/start`, {
     method: 'POST',
     body: JSON.stringify(data || {}),
   }) as Promise<OAuthStartResponse>,
@@ -572,9 +783,9 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({}),
   }) as Promise<{ success: true; quota: OAuthQuotaInfo }>,
-  rebindOAuthConnection: (accountId: number) => request(`/api/oauth/connections/${accountId}/rebind`, {
+  rebindOAuthConnection: (accountId: number, data?: { proxyUrl?: string | null }) => request(`/api/oauth/connections/${accountId}/rebind`, {
     method: 'POST',
-    body: JSON.stringify({}),
+    body: JSON.stringify(data || {}),
   }) as Promise<OAuthStartResponse>,
   deleteOAuthConnection: (accountId: number) => request(`/api/oauth/connections/${accountId}`, {
     method: 'DELETE',
@@ -604,10 +815,39 @@ export const api = {
   }),
   getRuntimeSettings: () => request('/api/settings/runtime'),
   getBrandList: () => request('/api/settings/brand-list'),
-  updateRuntimeSettings: (data: any) => request('/api/settings/runtime', {
+  updateRuntimeSettings: (data: RuntimeSettingsPayload) => request('/api/settings/runtime', {
     method: 'PUT',
     body: JSON.stringify(data),
   }),
+  getUpdateCenterStatus: () => request('/api/update-center/status'),
+  saveUpdateCenterConfig: (data: any) => request('/api/update-center/config', {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  }),
+  checkUpdateCenter: () => request('/api/update-center/check', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  }),
+  deployUpdateCenter: (data: {
+    source: 'github-release' | 'docker-hub-tag';
+    targetTag: string;
+    targetDigest?: string | null;
+  }) => request('/api/update-center/deploy', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  rollbackUpdateCenter: (data: { targetRevision: string }) => request('/api/update-center/rollback', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  streamUpdateCenterTaskLogs: (
+    taskId: string,
+    handlers: {
+      onLog?: (entry: any) => void;
+      onDone?: (payload: any) => void;
+      signal?: AbortSignal;
+    },
+  ) => streamSse(`/api/update-center/tasks/${encodeURIComponent(taskId)}/stream`, handlers),
   testSystemProxy: (data: SystemProxyTestRequest) => request('/api/settings/system-proxy/test', {
     method: 'POST',
     body: JSON.stringify(data),
